@@ -67,15 +67,20 @@ async def generate_sigmas(request):
             total_steps = steps
 
         # 使用 comfy 的 sigma 计算 (用默认 model_sampling 作近似)
-        # 注意：没有实际 model 时，用 comfy 的默认 model_sampling
         try:
             model_sampling = comfy.model_sampling.ModelSamplingDiscrete()
             sigmas = comfy.samplers.calculate_sigmas(model_sampling, scheduler, total_steps)
             if denoise < 1.0:
                 sigmas = sigmas[-(steps + 1):]
         except Exception:
-            # 如果 scheduler 不支持或出错，生成线性衰减作为 fallback
-            sigmas = torch.linspace(14.6146, 0.0, steps + 1)
+            # fallback: 线性衰减
+            sigmas = torch.linspace(1.0, 0.0, steps + 1)
+
+        # 归一化到 [0, 1]
+        sig_max = sigmas.max()
+        if sig_max > 0:
+            sigmas = sigmas / sig_max
+        sigmas = sigmas.clamp(0.0, 1.0)
 
         str_values = [f"{x:.4f}" for x in sigmas.tolist()]
         generated_string = "[" + ", ".join(str_values) + "]"
@@ -127,8 +132,9 @@ class LaoliSigmaEditor:
         except ValueError: pass
 
         if len(values) > 0:
-            sigmas = torch.FloatTensor(values)
-            generated_string = sigma_string  # 保持用户输入的原样
+            sigmas = torch.FloatTensor(values).clamp(0.0, 1.0)
+            str_values = [f"{x:.4f}" for x in sigmas.tolist()]
+            generated_string = "[" + ", ".join(str_values) + "]"
         else:
             # 2. 自动计算
             total_steps = steps
@@ -139,6 +145,12 @@ class LaoliSigmaEditor:
             model_sampling = model.get_model_object("model_sampling")
             sigmas = comfy.samplers.calculate_sigmas(model_sampling, scheduler, total_steps)
             if denoise < 1.0: sigmas = sigmas[-(steps + 1):]
+
+            # 归一化到 [0, 1]
+            sig_max = sigmas.max()
+            if sig_max > 0:
+                sigmas = sigmas / sig_max
+            sigmas = sigmas.clamp(0.0, 1.0)
 
             str_values = [f"{x:.4f}" for x in sigmas.tolist()]
             generated_string = "[" + ", ".join(str_values) + "]"
