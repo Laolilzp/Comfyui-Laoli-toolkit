@@ -2,7 +2,7 @@ import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
 // 启动标志
-console.log("%c[老李-工具箱]  已加载", "color:white; background:#d9230f; padding:4px");
+console.log("%c[老李-工具箱] V19.0 (参数联动+预设修复) 已加载", "color:white; background:#d9230f; padding:4px");
 
 app.registerExtension({
     name: "Laoli.SigmaEditor.FinalFix",
@@ -192,7 +192,8 @@ app.registerExtension({
                         return;
                     }
                     const matches = str.match(/-?\d*\.?\d+(?:[eE][-+]?\d+)?/g);
-                    node.laoli_sigmas = matches ? matches.map(Number) : [];
+                    // 所有值 clamp 到 [0, 1]
+                    node.laoli_sigmas = matches ? matches.map(v => Math.max(0, Math.min(1, Number(v)))) : [];
                     node.setDirtyCanvas(true, true);
                 };
                 setTimeout(() => { if(sigmaWidget && sigmaWidget.value) node.refreshCurve(sigmaWidget.value); }, 200);
@@ -243,7 +244,7 @@ app.registerExtension({
                                 let clampedY = Math.max(topY, Math.min(bottomY, pos[1]));
                                 let ratio = (bottomY - clampedY) / layout.h;
                                 ratio = Math.max(0, Math.min(1, ratio));
-                                node.laoli_sigmas[node.dragIndex] = ratio * node.maxVal;
+                                node.laoli_sigmas[node.dragIndex] = Math.max(0, Math.min(1, ratio * node.maxVal));
                                 node.setDirtyCanvas(true, true);
                                 return true;
                             }
@@ -295,15 +296,14 @@ app.registerExtension({
                             return;
                         }
 
-                        // 坐标系
-                        let maxVal = Math.max(...sigmas, 1.0);
-                        maxVal = Math.ceil(maxVal * 10) / 10;
+                        // 坐标系 — Y 轴固定 [0, 1]
+                        const maxVal = 1.0;
                         node.maxVal = maxVal;
 
                         // Y轴
                         ctx.font = "10px Arial"; ctx.textAlign = "right"; ctx.textBaseline = "middle"; ctx.lineWidth = 1;
-                        for (let v = 0; v <= maxVal + 0.001; v += 0.1) {
-                            const ratio = v / maxVal;
+                        for (let v = 0; v <= 1.001; v += 0.1) {
+                            const ratio = v;
                             const lineY = chartY + chartH - (ratio * chartH);
                             const isMajor = (Math.abs(v % 0.5) < 0.01 || v < 0.01);
                             ctx.strokeStyle = isMajor ? "#555" : "#222";
@@ -482,7 +482,7 @@ app.registerExtension({
                         let clampedY = Math.max(topY, Math.min(bottomY, pos[1]));
                         let ratio = (bottomY - clampedY) / layout.h;
                         ratio = Math.max(0, Math.min(1, ratio));
-                        node.laoli_sigmas[node.dragIndex] = ratio * node.maxVal;
+                        node.laoli_sigmas[node.dragIndex] = Math.max(0, Math.min(1, ratio * node.maxVal));
                         node.setDirtyCanvas(true, true);
                         return true;
                     }
