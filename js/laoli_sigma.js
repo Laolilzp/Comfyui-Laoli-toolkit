@@ -2,7 +2,7 @@ import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
 // 启动标志
-console.log("%c[老李-工具箱] V19.0 (参数联动+预设修复) 已加载", "color:white; background:#d9230f; padding:4px");
+console.log("%c[老李-工具箱] 已加载", "color:white; background:#d9230f; padding:4px");
 
 app.registerExtension({
     name: "Laoli.SigmaEditor.FinalFix",
