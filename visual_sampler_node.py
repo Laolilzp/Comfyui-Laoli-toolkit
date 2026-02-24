@@ -13,6 +13,7 @@ import base64
 import gc
 from io import BytesIO
 import numpy as np
+import weakref
 
 try:
     from PIL import Image
@@ -29,7 +30,8 @@ try:
 except ImportError:
     comfy.latent_preview = None
 
-_vs_cache = {}
+# 使用弱引用字典，防止 model_sampling (内部持有模型引用) 导致模型永远驻留显存
+_vs_cache = weakref.WeakValueDictionary()
 _vs_stage1_cache = {}
 
 
@@ -77,36 +79,19 @@ def _get_latent_format(model):
     return lf
 
 
-def _detect_expected_pixel_size(vae, lat_h, lat_w):
-
-    try:
-        with torch.no_grad():
-            test_size = 64
-            test_px = torch.zeros(1, test_size, test_size, 3, dtype=torch.float32)
-            test_lat = vae.encode(test_px)
-
-            vae_lat_h = test_lat.shape[-2]
-            vae_lat_w = test_lat.shape[-1]
-            vae_channels = test_lat.shape[1]
-            ratio = test_size // vae_lat_h
-            del test_px, test_lat
-
-            return lat_h * 8, lat_w * 8, ratio, vae_channels
-    except:
-        return lat_h * 8, lat_w * 8, 8, 16
-
-
 def _safe_vae_encode(vae, pixels, node_id=None):
     _soft_clean_vram()
     with torch.no_grad():
         pixels = pixels.cpu()
+        
+        if pixels.numel() == 0:
+            raise ValueError("⚠️ 输入编码的像素张量为空！")
+
+        old_crop = getattr(vae, "crop_input", False)
+        
         if pixels.ndim == 5:
             B, T, H, W, C = pixels.shape
-        else:
-            B, H, W, C = pixels.shape
-        _update_status(node_id, f"📦 VAE 编码 (像素: {W}x{H})...")
-        if pixels.ndim == 5:
-            old_crop = getattr(vae, "crop_input", False)
+            _update_status(node_id, f"📦 VAE 编码 (像素: {W}x{H})...")
             if old_crop:
                 try:
                     ratio = vae.spacial_compression_encode()
@@ -119,27 +104,43 @@ def _safe_vae_encode(vae, pixels, node_id=None):
                     x_off = (W % ratio) // 2
                     pixels = pixels[:, :, y_off:y_off + H_new, x_off:x_off + W_new, :]
                 vae.crop_input = False
-            try:
-                res = vae.encode(pixels)
-            except Exception as e:
-                err_msg = str(e).lower()
-                if any(k in err_msg for k in ["conv2d", "expected", "3d", "4d"]):
-                    res = vae.encode(pixels.reshape(B * T, H, W, C))
-                else:
-                    raise e
-            finally:
-                if old_crop:
-                    vae.crop_input = old_crop
         else:
-            try:
-                res = vae.encode(pixels)
-            except comfy.model_management.OOM_EXCEPTION:
+            B, H, W, C = pixels.shape
+            _update_status(node_id, f"📦 VAE 编码 (像素: {W}x{H})...")
+
+        try:
+            res = vae.encode(pixels)
+        except Exception as e:
+            err_msg = str(e).lower()
+            if any(k in err_msg for k in ["conv2d", "expected", "3d", "4d", "size"]):
+                _update_status(node_id, "⚠️ VAE架构维度不匹配，自适应降维编码中...")
+                if pixels.ndim == 5:
+                    pixels_4d = pixels.reshape(B * T, H, W, C)
+                else:
+                    pixels_4d = pixels
+                    
+                try:
+                    res = vae.encode(pixels_4d)
+                except comfy.model_management.OOM_EXCEPTION:
+                    _update_status(node_id, "⚠️ VAE编码OOM，切块...")
+                    _force_clean_vram()
+                    if hasattr(vae, "encode_tiled"):
+                        res = vae.encode_tiled(pixels_4d, tile_x=512, tile_y=512)
+                    else:
+                        res = vae.encode(pixels_4d)
+            elif "oom" in err_msg or "memory" in err_msg or "allocate" in err_msg:
                 _update_status(node_id, "⚠️ VAE编码OOM，切块...")
                 _force_clean_vram()
                 if hasattr(vae, "encode_tiled"):
-                    res = vae.encode_tiled(pixels, tile_x=512, tile_y=512).cpu()
+                    res = vae.encode_tiled(pixels, tile_x=512, tile_y=512)
                 else:
                     res = vae.encode(pixels)
+            else:
+                raise e
+        finally:
+            if old_crop:
+                vae.crop_input = old_crop
+                
         res_cpu = res.cpu()
         del res, pixels
         _soft_clean_vram()
@@ -155,6 +156,14 @@ def _safe_vae_decode(vae, latent_samples, node_id=None):
             res = vae.decode(latent_samples)
             res_cpu = res.cpu()
             del res
+            
+            if res_cpu.ndim == 5:
+                if res_cpu.shape[1] in [1, 3, 4] and res_cpu.shape[-1] not in [1, 3, 4]:
+                    res_cpu = res_cpu.permute(0, 2, 3, 4, 1)
+            elif res_cpu.ndim == 4:
+                if res_cpu.shape[1] in [1, 3, 4] and res_cpu.shape[-1] not in [1, 3, 4]:
+                    res_cpu = res_cpu.permute(0, 2, 3, 1)
+                    
             _soft_clean_vram()
             return res_cpu
         except Exception as e:
@@ -166,13 +175,18 @@ def _safe_vae_decode(vae, latent_samples, node_id=None):
                     res = vae.decode_tiled(latent_samples, tile_x=128, tile_y=128, overlap=32)
                     res_cpu = res.cpu()
                     del res
+                    
+                    if res_cpu.ndim == 5 and res_cpu.shape[1] in [1, 3, 4] and res_cpu.shape[-1] not in [1, 3, 4]:
+                        res_cpu = res_cpu.permute(0, 2, 3, 4, 1)
+                    elif res_cpu.ndim == 4 and res_cpu.shape[1] in [1, 3, 4] and res_cpu.shape[-1] not in [1, 3, 4]:
+                        res_cpu = res_cpu.permute(0, 2, 3, 1)
+                        
                     _soft_clean_vram()
                     return res_cpu
             raise e
 
 
-def _color_match(target, source, strength=0.9):
-
+def _color_match(target, source, strength=1.0):
     if target is None or source is None:
         return target
     if target.shape[-1] != 3 or source.shape[-1] != 3:
@@ -189,10 +203,6 @@ def _color_match(target, source, strength=0.9):
                 mode="bilinear", align_corners=False
             ).permute(0, 2, 3, 1).clamp(0, 1)
 
-        # RGB → YCbCr（近似）
-        # Y  =  0.299R + 0.587G + 0.114B
-        # Cb = -0.169R - 0.331G + 0.500B + 0.5
-        # Cr =  0.500R - 0.419G - 0.081B + 0.5
         def rgb_to_ycbcr(img):
             r, g, b = img[..., 0:1], img[..., 1:2], img[..., 2:3]
             y  =  0.299 * r + 0.587 * g + 0.114 * b
@@ -209,35 +219,31 @@ def _color_match(target, source, strength=0.9):
 
         target_ycbcr = rgb_to_ycbcr(target)
         source_ycbcr = rgb_to_ycbcr(source)
-
         result_ycbcr = target_ycbcr.clone()
 
         for b in range(target.shape[0]):
             src_b = min(b, source.shape[0] - 1)
 
-
-            for c in [1, 2]:  # Cb, Cr
+            for c in [1, 2]:
                 tc = target_ycbcr[b, :, :, c]
                 sc = source_ycbcr[src_b, :, :, c]
 
-                t_mean = tc.mean()
-                t_std = tc.std() + 1e-6
-                s_mean = sc.mean()
-                s_std = sc.std() + 1e-6
+                t_mean, t_std = tc.mean(), tc.std() + 1e-5
+                s_mean, s_std = sc.mean(), sc.std() + 1e-5
 
-                matched = (tc - t_mean) * (s_std / t_std) + s_mean
-
+                std_ratio = torch.clamp(s_std / t_std, 0.2, 3.0)
+                matched = (tc - t_mean) * std_ratio + s_mean
                 result_ycbcr[b, :, :, c] = tc * (1 - strength) + matched * strength
 
             y_tc = target_ycbcr[b, :, :, 0]
             y_sc = source_ycbcr[src_b, :, :, 0]
-            y_t_mean = y_tc.mean()
-            y_t_std = y_tc.std() + 1e-6
-            y_s_mean = y_sc.mean()
-            y_s_std = y_sc.std() + 1e-6
-            y_matched = (y_tc - y_t_mean) * (y_s_std / y_t_std) + y_s_mean
+            y_t_mean, y_t_std = y_tc.mean(), y_tc.std() + 1e-5
+            y_s_mean, y_s_std = y_sc.mean(), y_sc.std() + 1e-5
+            
+            y_std_ratio = torch.clamp(y_s_std / y_t_std, 0.5, 2.0)
+            y_matched = (y_tc - y_t_mean) * y_std_ratio + y_s_mean
 
-            y_strength = strength * 0.3
+            y_strength = strength * 0.85 
             result_ycbcr[b, :, :, 0] = y_tc * (1 - y_strength) + y_matched * y_strength
 
         result_rgb = ycbcr_to_rgb(result_ycbcr)
@@ -246,6 +252,7 @@ def _color_match(target, source, strength=0.9):
     except Exception as e:
         print(f" ⚠️ 颜色匹配失败: {e}")
         return target
+
 
 class SafeNativePreviewer:
     def __init__(self, latent_format):
@@ -265,13 +272,16 @@ class SafeNativePreviewer:
         with torch.no_grad():
             try:
                 x0_sys = x0[0:1].detach().clone().cpu().float()
-                if hasattr(self.latent_format, "process_out"):
-                    try:
-                        out = self.latent_format.process_out(x0_sys)
-                        if out is not None:
-                            x0_sys = out
-                    except:
-                        pass
+                
+                if x0_sys.shape[1] != self.factors.shape[0]:
+                    if hasattr(self.latent_format, "process_out"):
+                        try:
+                            out = self.latent_format.process_out(x0_sys)
+                            if out is not None:
+                                x0_sys = out
+                        except:
+                            pass
+                            
                 if x0_sys.shape[1] != self.factors.shape[0]:
                     C_in = x0_sys.shape[1]
                     C_out = self.factors.shape[0]
@@ -279,6 +289,7 @@ class SafeNativePreviewer:
                         B, _, H, W = x0_sys.shape
                         x0_sys = x0_sys.reshape(B, C_out, 2, 2, H, W) \
                             .permute(0, 1, 4, 2, 5, 3).reshape(B, C_out, H * 2, W * 2)
+                            
                 rgb = x0_sys.permute(0, 2, 3, 1) @ self.factors
                 if self.bias is not None:
                     rgb = rgb + self.bias
@@ -300,17 +311,75 @@ def _create_native_previewer(model):
     latent_format = _get_latent_format(model)
     if latent_format is None:
         return None
+        
     if comfy.latent_preview is not None:
         try:
-            previewer = comfy.latent_preview.get_previewer(
-                getattr(model, 'load_device', "cpu"), latent_format)
-            if previewer and "taesd" in previewer.__class__.__name__.lower():
+            device = getattr(model, 'load_device', "cpu")
+            previewer = comfy.latent_preview.get_previewer(device, latent_format)
+            if previewer is not None:
                 return previewer
         except:
             pass
+            
     if hasattr(latent_format, 'latent_rgb_factors') and latent_format.latent_rgb_factors is not None:
         return SafeNativePreviewer(latent_format)
     return None
+
+
+def _latent_to_preview_base64_fallback(latent_samples, max_size=384):
+    try:
+        if latent_samples is None or Image is None:
+            return ""
+        s = latent_samples.cpu().float()
+        
+        if s.ndim == 5:
+            s = s[0, :, 0, :, :]
+        elif s.ndim == 4:
+            s = s[0]
+
+        c = s.shape[0]
+        if c == 4:
+            r = s[0] * 0.298 + s[1] * 0.187 - s[2] * 0.158 - s[3] * 0.184
+            g = s[0] * 0.207 + s[1] * 0.286 + s[2] * 0.189 - s[3] * 0.271
+            b = s[0] * 0.208 + s[1] * 0.173 + s[2] * 0.264 - s[3] * 0.473
+            rgb = torch.stack([r, g, b], dim=0)
+            
+        elif c >= 16:
+            factors = torch.tensor([
+                [-0.0346,  0.0244,  0.0681], [ 0.0034,  0.0210,  0.0687], [ 0.0275, -0.0668, -0.0433], [-0.0174,  0.0160,  0.0617],
+                [ 0.0859,  0.0721,  0.0329], [ 0.0004,  0.0383,  0.0115], [ 0.0405,  0.0861,  0.0915], [-0.0236, -0.0185, -0.0259],
+                [-0.0245,  0.0250,  0.0460], [ 0.0406,  0.0528,  0.0606], [-0.0173, -0.0207, -0.0076], [ 0.0416,  0.0458,  0.0519],
+                [ 0.0526,  0.0754,  0.0945], [-0.0337, -0.0142, -0.0187], [-0.0254, -0.0334, -0.0458], [-0.0204, -0.0330, -0.0415]
+            ], dtype=torch.float32, device="cpu")
+            if c > 16:
+                pad = torch.zeros((c - 16, 3), dtype=torch.float32, device="cpu")
+                factors = torch.cat([factors, pad], dim=0)
+            rgb_img = s.permute(1, 2, 0) @ factors
+            rgb = rgb_img.permute(2, 0, 1)
+            
+        else:
+            rgb = s[:3].clone()
+            
+        mn, mx = rgb.min(), rgb.max()
+        if mx - mn > 0.001:
+            rgb = (rgb - mn) / (mx - mn)
+        else:
+            rgb = rgb * 0 + 0.5
+            
+        rgb = rgb.clamp(0, 1)
+        img_np = (rgb.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        pil_img = Image.fromarray(img_np)
+        w, h = pil_img.size
+        pil_img = pil_img.resize((w * 8, h * 8), Image.BILINEAR)
+        w, h = pil_img.size
+        scale = min(max_size / max(w, h, 1), 1.0)
+        if scale < 1.0:
+            pil_img = pil_img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+        buf = BytesIO()
+        pil_img.save(buf, format='JPEG', quality=85)
+        return base64.b64encode(buf.getvalue()).decode('utf-8')
+    except Exception:
+        return ""
 
 
 def _tensor_to_base64(image_tensor, max_size=384):
@@ -423,7 +492,6 @@ def _native_ksampler(model, seed, steps, cfg, sampler_name, scheduler,
                      denoise=1.0, disable_noise=False,
                      start_step=None, last_step=None,
                      sigmas=None, callback=None, node_id=None):
-
     latent = latent_image.copy()
     latent_samples = latent["samples"].cpu()
     latent_samples = comfy.sample.fix_empty_latent_channels(model, latent_samples)
@@ -468,10 +536,74 @@ def _native_ksampler(model, seed, steps, cfg, sampler_name, scheduler,
         guider.set_cfg(cfg)
 
     _soft_clean_vram()
-    out_samples = guider.sample(
-        noise, latent_samples, comfy.samplers.sampler_object(sampler_name),
-        run_sigmas, denoise_mask=latent.get("noise_mask"),
-        callback=callback, seed=seed)
+    
+    # ★ 核心防弹护城河：检测并化解跨架构坍塌 (5D 强行塞入 2D 模型)
+    try:
+        out_samples = guider.sample(
+            noise, latent_samples, comfy.samplers.sampler_object(sampler_name),
+            run_sigmas, denoise_mask=latent.get("noise_mask"),
+            callback=callback, seed=seed)
+    except Exception as e:
+        err_msg = str(e).lower()
+        if latent_samples.ndim == 5 and any(k in err_msg for k in ["unpack", "4d", "mismatch", "shape", "conv2d"]):
+            _update_status(node_id, "⚠️ 检测到2D模型接收了3D/5D环境，启动自适应防弹降维重试...")
+            _soft_clean_vram()
+            
+            B, C, T, H, W = latent_samples.shape
+            
+            # 主环境降维
+            latent_4d = latent_samples.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
+            noise_4d = noise.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
+            
+            # Mask降维
+            denoise_mask_4d = latent.get("noise_mask")
+            if denoise_mask_4d is not None:
+                if denoise_mask_4d.shape[0] == B:
+                    if denoise_mask_4d.ndim == 4 and denoise_mask_4d.shape[1] == T:
+                        denoise_mask_4d = denoise_mask_4d.reshape(B * T, denoise_mask_4d.shape[2], denoise_mask_4d.shape[3])
+                    else:
+                        denoise_mask_4d = denoise_mask_4d.unsqueeze(1).repeat(1, T, 1, 1).reshape(B * T, denoise_mask_4d.shape[-2], denoise_mask_4d.shape[-1])
+            
+            # 参考条件中的潜入炸弹(如 AIO 模型的参考隐空间)全局递归搜索并安全折叠
+            def flatten_any(obj):
+                if isinstance(obj, torch.Tensor):
+                    if obj.ndim == 5:
+                        _B, _C, _T, _H, _W = obj.shape
+                        return obj.permute(0, 2, 1, 3, 4).reshape(_B * _T, _C, _H, _W)
+                elif isinstance(obj, dict):
+                    return {k: flatten_any(v) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [flatten_any(v) for v in obj]
+                elif isinstance(obj, tuple):
+                    return tuple(flatten_any(v) for v in obj)
+                return obj
+
+            def flatten_conds(conds):
+                if not conds: return conds
+                new_conds = []
+                for t in conds:
+                    new_conds.append([flatten_any(t[0]), flatten_any(t[1])])
+                return new_conds
+
+            try:
+                guider_4d = comfy.samplers.CFGGuider(model)
+                guider_4d.set_conds(flatten_conds(positive), flatten_conds(negative))
+                guider_4d.set_cfg(cfg)
+            except:
+                from comfy.samplers import CFGGuider
+                guider_4d = CFGGuider(model)
+                guider_4d.set_conds(flatten_conds(positive), flatten_conds(negative))
+                guider_4d.set_cfg(cfg)
+                
+            out_4d = guider_4d.sample(
+                noise_4d, latent_4d, comfy.samplers.sampler_object(sampler_name),
+                run_sigmas, denoise_mask=denoise_mask_4d,
+                callback=callback, seed=seed)
+            
+            # 2D 跑完后重构完美视频/3D数据结构
+            out_samples = out_4d.reshape(B, T, out_4d.shape[1], H, W).permute(0, 2, 1, 3, 4)
+        else:
+            raise e
 
     out_samples = out_samples.to(comfy.model_management.intermediate_device())
     latent["samples"] = out_samples
@@ -534,11 +666,13 @@ async def generate_vs_sigmas(request):
         scheduler = data.get("scheduler", "normal")
         total_steps = int(steps / denoise) if 0.0 < denoise < 1.0 else steps
         if total_steps == 0: total_steps = steps
+        
         ms = _vs_cache.get(f"{data.get('node_id', '')}_{data.get('target', '曲线_1')}")
         if ms: sigmas = comfy.samplers.calculate_sigmas(ms, scheduler, total_steps)
         else:
             try: sigmas = comfy.samplers.calculate_sigmas(comfy.model_sampling.ModelSamplingDiscrete(), scheduler, total_steps)
             except: sigmas = _vs_simulate_sigmas(scheduler, total_steps)
+            
         final = sigmas[-(steps+1):] if 0.0 < denoise < 1.0 else sigmas
         mx = float(sigmas[0]) if len(sigmas)>0 and float(sigmas[0])>0 else 1.0
         normed = (final / mx).clamp(0, 1)
@@ -616,31 +750,49 @@ class LaoliVisualSampler:
         return [[t[0], {**t[1], "latent_image": lat, "concat_latent_image": lat}] for t in conditioning]
 
     def _flatten_video(self, tensor):
+        if tensor is None: return None
         if tensor.ndim == 5:
             B, T, H, W, C = tensor.shape
             return tensor.reshape(B * T, H, W, C)
         return tensor
 
-    def _get_pixel_size(self, tensor, is_video):
-        if is_video: return tensor.shape[-3], tensor.shape[-2]
-        return tensor.shape[1], tensor.shape[2]
+    def _get_pixel_size(self, tensor):
+        if tensor.ndim == 5:
+            return tensor.shape[2], tensor.shape[3]
+        elif tensor.ndim == 4:
+            return tensor.shape[1], tensor.shape[2]
+        return 1, 1
 
-    def _pixel_upscale(self, image_4d, target_w, target_h, method):
-        return comfy.utils.common_upscale(
-            image_4d.movedim(-1, 1).cpu(), target_w, target_h, method, "disabled"
+    def _pixel_upscale(self, image, target_w, target_h, method):
+        img_4d = image
+        if img_4d.ndim == 5:
+            B, T, H, W, C = img_4d.shape
+            img_4d = img_4d.reshape(B * T, H, W, C)
+            
+        upscaled = comfy.utils.common_upscale(
+            img_4d.movedim(-1, 1).cpu(), target_w, target_h, method, "disabled"
         ).movedim(1, -1).clamp(0, 1)
+        
+        if image.ndim == 5:
+            return upscaled.reshape(B, T, target_h, target_w, C)
+        return upscaled
 
-    def _latent_upscale(self, latent_samples, target_lat_w, target_lat_h, method, is_video):
+    def _latent_upscale(self, latent_samples, target_lat_w, target_lat_h, method):
         s = latent_samples.cpu()
-        cur_h, cur_w = s.shape[-2], s.shape[-1]
-        if cur_h == target_lat_h and cur_w == target_lat_w: return s
-        if is_video:
+        
+        if s.ndim == 5:
             B, C, T, H, W = s.shape
             s_4d = s.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
         else:
             s_4d = s
+            
+        cur_h, cur_w = s_4d.shape[-2], s_4d.shape[-1]
+        if cur_h == target_lat_h and cur_w == target_lat_w: 
+            return s
+            
         s_4d = comfy.utils.common_upscale(s_4d, target_lat_w, target_lat_h, method, "disabled")
-        if is_video:
+        
+        if s.ndim == 5:
             return s_4d.reshape(B, T, C, target_lat_h, target_lat_w).permute(0, 2, 1, 3, 4)
         return s_4d
 
@@ -654,7 +806,6 @@ class LaoliVisualSampler:
             pos2 = kwargs.get("正面_2")
             neg2 = kwargs.get("负面_2", neg1)
             vae2 = kwargs.get("VAE_2", vae)
-            is_video = latent["samples"].ndim == 5
 
             orig_lat_H = latent["samples"].shape[-2]
             orig_lat_W = latent["samples"].shape[-1]
@@ -665,12 +816,12 @@ class LaoliVisualSampler:
             expected_pixel_W = orig_lat_W * 8
             _update_status(unique_id, f"📐 用户期望像素: {expected_pixel_W}x{expected_pixel_H}")
 
-
             ref_image = kwargs.get("参考图像", None)
             if ref_image is not None:
                 try:
                     _update_status(unique_id, "⚙️ 处理外部参考图像...")
-                    ref_px = ref_image.unsqueeze(1) if is_video and ref_image.ndim == 4 else ref_image
+                    is_5d = latent["samples"].ndim == 5
+                    ref_px = ref_image.unsqueeze(1) if is_5d and ref_image.ndim == 4 else ref_image
                     ref_lat = _safe_vae_encode(vae, ref_px, unique_id)
                     pos1 = self._apply_reference_latent(pos1, {"samples": ref_lat})
                     del ref_lat, ref_px
@@ -696,27 +847,46 @@ class LaoliVisualSampler:
             upscale_model = kwargs.get("放大模型", None)
             upscale_method = kwargs.get("放大算法", "bicubic")
 
-            custom_s1 = _vs_parse_sigmas(curve1, ms1, steps1, scheduler1, denoise1)
-            if curve1:
-                custom_s1 = custom_s1[min(start1, len(custom_s1)-1):min(end1, len(custom_s1)-1)+1]
-            mx1 = custom_s1[0].item() if custom_s1[0].item() > 0 else 1.0
-            has_vals = bool([x for x in curve1.replace('[','').replace(']','').replace('\n',',').split(',') if x.strip()])
-            ui1 = curve1 if curve1 and not has_vals else "["+", ".join([f"{v:.4f}" for v in (custom_s1/mx1).clamp(0,1).tolist()])+"]"
+            # ============== 一阶段曲线解析与持久化更新 ==============
+            total_steps1 = int(steps1 / denoise1) if 0.0 < denoise1 < 1.0 else steps1
+            if total_steps1 == 0: total_steps1 = steps1
+            try: ref1 = comfy.samplers.calculate_sigmas(ms1, scheduler1, total_steps1)
+            except: ref1 = torch.linspace(1.0, 0.0, total_steps1 + 1)
+            
+            global_max1 = float(ref1[0].item()) if len(ref1)>0 and ref1[0].item()>0 else 1.0
+            
+            custom_s1_full = _vs_parse_sigmas(curve1, ms1, steps1, scheduler1, denoise1)
+            has_vals1 = bool([x for x in curve1.replace('[','').replace(']','').replace('\n',',').split(',') if x.strip()])
+            
+            ui1 = curve1 if curve1 and not has_vals1 else "["+", ".join([f"{v:.4f}" for v in (custom_s1_full/global_max1).clamp(0,1).tolist()])+"]"
             PromptServer.instance.send_sync("laoli_vs_update", {"node_id": unique_id, "text": ui1, "target": "曲线_1"})
+            
+            if curve1:
+                custom_s1 = custom_s1_full[min(start1, len(custom_s1_full)-1):min(end1, len(custom_s1_full)-1)+1]
+            else:
+                custom_s1 = None
+            # =========================================================
 
-            # 缓存
             def hash_t(t):
                 try:
                     if isinstance(t, torch.Tensor) and t.numel() > 0:
-                        return f"{'_'.join(map(str, t.shape))}_{t.flatten()[t.numel()//2].item():.4f}"
+                        return f"{'_'.join(map(str, t.shape))}_{float(t.sum()):.4f}_{float(t.std()):.4f}"
                 except: pass
                 return "none"
+                
             pos_t = pos1[0][0] if pos1 and isinstance(pos1, list) and len(pos1)>0 else None
             neg_t = neg1[0][0] if neg1 and isinstance(neg1, list) and len(neg1)>0 else None
             up_name = upscale_model.__class__.__name__ if upscale_model else "none"
-            s1_key = (f"{unique_id}_{model1.__class__.__name__}_{hash_t(pos_t)}_{hash_t(neg_t)}_"
+
+            s1_sampler = kwargs.get("采样器_1")
+            s1_add_noise = kwargs.get("添加噪波_1", "enable")
+            s1_ret_noise = kwargs.get("返回噪波_1", "disable")
+
+            s1_key = (f"{unique_id}_{id(model1)}_{hash_t(pos_t)}_{hash_t(neg_t)}_"
                       f"{hash_t(latent.get('samples'))}_{seed1}_{steps1}_{cfg1}_{denoise1}_"
-                      f"{upscale_factor}_{upscale_mode}_{upscale_method}_{up_name}_v16")
+                      f"{s1_sampler}_{scheduler1}_{s1_add_noise}_{s1_ret_noise}_"
+                      f"{start1}_{end1}_{hash_t(custom_s1)}_"
+                      f"{upscale_factor}_{upscale_mode}_{upscale_method}_{up_name}_v20")
 
             global _vs_stage1_cache
             cached = _vs_stage1_cache.get(unique_id)
@@ -727,7 +897,7 @@ class LaoliVisualSampler:
                 preview_1 = cached['preview_1'].clone()
                 stage1_final_image = cached.get('stage1_final_image', preview_1).clone()
                 color_ref_image = cached.get('color_ref_image', preview_1).clone()
-                s1_h, s1_w = self._get_pixel_size(preview_1, is_video)
+                s1_h, s1_w = self._get_pixel_size(preview_1)
                 PromptServer.instance.send_sync("laoli_vs_preview", {
                     "node_id": unique_id, "stage": "stage1",
                     "image": _tensor_to_base64(preview_1), "final": True,
@@ -736,15 +906,14 @@ class LaoliVisualSampler:
                     "lat_w": int(latent_out_1["samples"].shape[-1])
                 })
             else:
-                # ===== 一阶段采样 =====
                 _update_status(unique_id, f"🚀 [一阶段] 采样")
                 latent_out_1 = _native_ksampler(
-                    model1, seed1, steps1, cfg1, kwargs.get("采样器_1"), scheduler1,
+                    model1, seed1, steps1, cfg1, s1_sampler, scheduler1,
                     pos1, neg1, latent, denoise=denoise1,
-                    disable_noise=(kwargs.get("添加噪波_1","enable")=="disable"),
+                    disable_noise=(s1_add_noise == "disable"),
                     start_step=start1 if start1>0 else None,
                     last_step=end1 if end1<10000 else None,
-                    sigmas=custom_s1 if curve1 else None,
+                    sigmas=custom_s1,
                     callback=self._make_step_callback(unique_id, "stage1", _create_native_previewer(model1)),
                     node_id=unique_id)
 
@@ -755,33 +924,20 @@ class LaoliVisualSampler:
                     _update_status(unique_id, "🗑️ 卸载一阶段模型...")
                     _full_unload_models()
 
-                # ===== VAE 解码 =====
                 raw_decoded = _safe_vae_decode(vae, latent_out_1["samples"], unique_id)
-                raw_h, raw_w = self._get_pixel_size(raw_decoded, is_video)
+                raw_h, raw_w = self._get_pixel_size(raw_decoded)
 
                 _update_status(unique_id,
                                f"🖼️ VAE原始解码: {raw_w}x{raw_h}, 期望: {expected_pixel_W}x{expected_pixel_H}")
 
                 if raw_w != expected_pixel_W or raw_h != expected_pixel_H:
-                    _update_status(unique_id,
-                                   f"🔧 尺寸校正: {raw_w}x{raw_h} → {expected_pixel_W}x{expected_pixel_H}")
-                    if is_video:
-                        raw_4d = raw_decoded.reshape(-1, raw_h, raw_w, raw_decoded.shape[-1])
-                    else:
-                        raw_4d = raw_decoded
-                    corrected_4d = self._pixel_upscale(raw_4d, expected_pixel_W, expected_pixel_H, upscale_method)
-                    if is_video:
-                        preview_1 = corrected_4d.reshape(
-                            raw_decoded.shape[0], raw_decoded.shape[1],
-                            expected_pixel_H, expected_pixel_W, raw_decoded.shape[-1])
-                    else:
-                        preview_1 = corrected_4d
-                    del raw_4d, corrected_4d
+                    _update_status(unique_id, f"🔧 尺寸校正: {raw_w}x{raw_h} → {expected_pixel_W}x{expected_pixel_H}")
+                    preview_1 = self._pixel_upscale(raw_decoded, expected_pixel_W, expected_pixel_H, upscale_method)
                 else:
                     preview_1 = raw_decoded
                 del raw_decoded
 
-                s1_h, s1_w = self._get_pixel_size(preview_1, is_video)
+                s1_h, s1_w = self._get_pixel_size(preview_1)
                 _update_status(unique_id, f"🖼️ 一阶段最终: {s1_w}x{s1_h}")
 
                 PromptServer.instance.send_sync("laoli_vs_preview", {
@@ -794,22 +950,18 @@ class LaoliVisualSampler:
                 color_ref_image = preview_1.clone()
                 stage1_final_image = preview_1
 
-                # ===== 放大处理 =====
                 if upscale_mode in ["image", "图像+参考latent"]:
-
-                    if is_video:
+                    if preview_1.ndim == 5:
                         p1_4d = preview_1.reshape(-1, s1_h, s1_w, preview_1.shape[-1])
                     else:
                         p1_4d = preview_1
 
                     if upscale_model is not None:
-                        # 步骤1: AI放大模型放大
                         upscaled_4d, ai_scale = _upscale_with_model(upscale_model, p1_4d, unique_id)
                         ai_h, ai_w = upscaled_4d.shape[1], upscaled_4d.shape[2]
                         _update_status(unique_id,
                                        f"📊 AI放大后: {ai_w}x{ai_h} ({ai_scale}x)")
 
-                        # 步骤2: 根据放大倍数缩放 AI 放大后的图像
                         if abs(upscale_factor - 1.0) > 0.05:
                             final_w = max(8, (round(ai_w * upscale_factor) // 8) * 8)
                             final_h = max(8, (round(ai_h * upscale_factor) // 8) * 8)
@@ -821,18 +973,16 @@ class LaoliVisualSampler:
                         del upscaled_4d
 
                     elif abs(upscale_factor - 1.0) > 0.05:
-                        # 无放大模型，直接算法缩放
                         final_w = max(8, (round(s1_w * upscale_factor) // 8) * 8)
                         final_h = max(8, (round(s1_h * upscale_factor) // 8) * 8)
                         _update_status(unique_id,
                                        f"📐 算法缩放: {s1_w}x{s1_h} → {final_w}x{final_h}")
                         result_4d = self._pixel_upscale(p1_4d, final_w, final_h, upscale_method)
                     else:
-                        # 无放大模型+倍数1.0 = 不做任何处理
                         result_4d = None
 
                     if result_4d is not None:
-                        if is_video:
+                        if preview_1.ndim == 5:
                             final_pixel_h, final_pixel_w = result_4d.shape[1], result_4d.shape[2]
                             stage1_final_image = result_4d.reshape(
                                 preview_1.shape[0], preview_1.shape[1],
@@ -841,7 +991,6 @@ class LaoliVisualSampler:
                             stage1_final_image = result_4d
                         del result_4d
 
-                        # 编码回latent
                         _update_status(unique_id, f"📦 编码放大图→Latent...")
                         latent_out_1 = {"samples": _safe_vae_encode(vae2, stage1_final_image, unique_id)}
                         _update_status(unique_id, f"📦 编码后Latent: {list(latent_out_1['samples'].shape)}")
@@ -849,7 +998,6 @@ class LaoliVisualSampler:
                     del p1_4d
 
                 else:
-                    # Latent 空间放大
                     sampled_lat_H = latent_out_1["samples"].shape[-2]
                     sampled_lat_W = latent_out_1["samples"].shape[-1]
                     target_lat_W = max(1, round(sampled_lat_W * upscale_factor))
@@ -860,7 +1008,7 @@ class LaoliVisualSampler:
                         _update_status(unique_id,
                                        f"📐 Latent缩放: {sampled_lat_W}x{sampled_lat_H} → {target_lat_W}x{target_lat_H}")
                         latent_out_1 = {"samples": self._latent_upscale(
-                            latent_out_1["samples"], target_lat_W, target_lat_H, upscale_method, is_video)}
+                            latent_out_1["samples"], target_lat_W, target_lat_H, upscale_method)}
                         need_redecode = True
 
                     if id(vae) != id(vae2):
@@ -882,7 +1030,6 @@ class LaoliVisualSampler:
                     'color_ref_image': color_ref_image.cpu().clone(),
                 }
 
-            # ===== 二阶段 =====
             if upscale_mode == "图像+参考latent" and pos2 is not None:
                 _update_status(unique_id, "🔗 注入参考Latent...")
                 pos2 = self._apply_reference_latent(pos2, latent_out_1)
@@ -890,7 +1037,7 @@ class LaoliVisualSampler:
             if pos2 is None:
                 p1 = self._flatten_video(preview_1)
                 f_img = self._flatten_video(stage1_final_image)
-                sf_h, sf_w = self._get_pixel_size(stage1_final_image, is_video)
+                sf_h, sf_w = self._get_pixel_size(stage1_final_image)
                 PromptServer.instance.send_sync("laoli_vs_preview", {
                     "node_id": unique_id, "stage": "stage2",
                     "image": _tensor_to_base64(stage1_final_image), "final": True,
@@ -902,17 +1049,29 @@ class LaoliVisualSampler:
                 _update_status(unique_id, "✅ 完毕 (无二阶段)")
                 return (p1, f_img, f_img, latent_out_1)
 
+            # ============== 二阶段参数准备与曲线持久化 ==============
             steps2 = kwargs.get("步数_2", 15)
             cfg2 = kwargs.get("CFG_2", 8.0)
             denoise2 = kwargs.get("降噪_2", 0.5)
             scheduler2 = kwargs.get("调度器_2", "simple")
             curve2 = kwargs.get("曲线_2", "")
 
-            custom_s2 = _vs_parse_sigmas(curve2, ms2, steps2, scheduler2, denoise2)
-            mx2 = custom_s2[0].item() if custom_s2[0].item() > 0 else 1.0
+            total_steps2 = int(steps2 / denoise2) if 0.0 < denoise2 < 1.0 else steps2
+            if total_steps2 == 0: total_steps2 = steps2
+            try: ref2 = comfy.samplers.calculate_sigmas(ms2, scheduler2, total_steps2)
+            except: ref2 = torch.linspace(1.0, 0.0, total_steps2 + 1)
+            
+            global_max2 = float(ref2[0].item()) if len(ref2)>0 and ref2[0].item()>0 else 1.0
+            
+            custom_s2_full = _vs_parse_sigmas(curve2, ms2, steps2, scheduler2, denoise2)
             has_vals2 = bool([x for x in curve2.replace('[','').replace(']','').replace('\n',',').split(',') if x.strip()])
-            ui2 = curve2 if curve2 and not has_vals2 else "["+", ".join([f"{v:.4f}" for v in (custom_s2/mx2).clamp(0,1).tolist()])+"]"
+            
+            ui2 = curve2 if curve2 and not has_vals2 else "["+", ".join([f"{v:.4f}" for v in (custom_s2_full/global_max2).clamp(0,1).tolist()])+"]"
             PromptServer.instance.send_sync("laoli_vs_update", {"node_id": unique_id, "text": ui2, "target": "曲线_2"})
+            
+            if curve2: custom_s2 = custom_s2_full
+            else: custom_s2 = None
+            # =========================================================
 
             _update_status(unique_id,
                            f"🚀 [二阶段] 重绘 (降噪:{denoise2}), Latent: {list(latent_out_1['samples'].shape)}")
@@ -920,7 +1079,7 @@ class LaoliVisualSampler:
             latent_out_final = _native_ksampler(
                 model2, seed2, steps2, cfg2, kwargs.get("采样器_2"), scheduler2,
                 pos2, neg2, latent_out_1, denoise=denoise2,
-                sigmas=custom_s2 if curve2 else None,
+                sigmas=custom_s2,
                 callback=self._make_step_callback(unique_id, "stage2", _create_native_previewer(model2)),
                 node_id=unique_id)
 
@@ -930,34 +1089,23 @@ class LaoliVisualSampler:
             _update_status(unique_id, "🎆 终极 VAE 解码...")
             final_image = _safe_vae_decode(vae2, latent_out_final["samples"], unique_id)
 
-
-            fi_h, fi_w = self._get_pixel_size(final_image, is_video)
-            sf_h, sf_w = self._get_pixel_size(stage1_final_image, is_video)
+            fi_h, fi_w = self._get_pixel_size(final_image)
+            sf_h, sf_w = self._get_pixel_size(stage1_final_image)
             if fi_w != sf_w or fi_h != sf_h:
                 _update_status(unique_id, f"🔧 二阶段尺寸校正: {fi_w}x{fi_h} → {sf_w}x{sf_h}")
-                if is_video:
-                    fi_4d = final_image.reshape(-1, fi_h, fi_w, final_image.shape[-1])
-                else:
-                    fi_4d = final_image
-                corrected = self._pixel_upscale(fi_4d, sf_w, sf_h, upscale_method)
-                if is_video:
-                    final_image = corrected.reshape(
-                        final_image.shape[0], final_image.shape[1], sf_h, sf_w, final_image.shape[-1])
-                else:
-                    final_image = corrected
+                final_image = self._pixel_upscale(final_image, sf_w, sf_h, upscale_method)
 
-            # 颜色匹配
             _update_status(unique_id, "🎨 颜色匹配...")
             final_flat = self._flatten_video(final_image)
             ref_flat = self._flatten_video(color_ref_image)
             matched_flat = _color_match(final_flat, ref_flat)
-            if is_video and final_image.ndim == 5:
+            if final_image.ndim == 5:
                 final_image = matched_flat.reshape(final_image.shape)
             else:
                 final_image = matched_flat
             del final_flat, ref_flat, matched_flat
 
-            fi_h, fi_w = self._get_pixel_size(final_image, is_video)
+            fi_h, fi_w = self._get_pixel_size(final_image)
             PromptServer.instance.send_sync("laoli_vs_preview", {
                 "node_id": unique_id, "stage": "stage2",
                 "image": _tensor_to_base64(final_image), "final": True,
@@ -986,15 +1134,34 @@ class LaoliVisualSampler:
             try:
                 if x0 is None: return
                 x0_cpu = x0[:, :, 0, :, :].detach().cpu() if x0.ndim == 5 else x0.detach().cpu()
-                if previewer and hasattr(previewer, 'decode_latent_to_preview_image'):
-                    res = previewer.decode_latent_to_preview_image("JPEG", x0_cpu)
-                    if isinstance(res, tuple) and len(res) >= 2:
-                        PromptServer.instance.send_sync("laoli_vs_preview", {
-                            "node_id": node_id, "stage": stage,
-                            "image": base64.b64encode(res[1]).decode('utf-8'),
-                            "step": step, "total": total_steps, "final": False,
-                            "lat_h": int(x0.shape[-2]), "lat_w": int(x0.shape[-1])
-                        })
+                
+                preview_b64 = None
+                
+                if previewer:
+                    try:
+                        if hasattr(previewer, 'decode_latent_to_preview_image'):
+                            res = previewer.decode_latent_to_preview_image("JPEG", x0_cpu)
+                            if isinstance(res, tuple) and len(res) >= 2:
+                                preview_b64 = base64.b64encode(res[1]).decode('utf-8')
+                        elif hasattr(previewer, 'decode_latent_to_preview'):
+                            pil_img = previewer.decode_latent_to_preview(x0_cpu)
+                            if pil_img:
+                                buf = BytesIO()
+                                pil_img.save(buf, format='JPEG', quality=85)
+                                preview_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+                    except Exception as e:
+                        pass
+                
+                if not preview_b64:
+                    preview_b64 = _latent_to_preview_base64_fallback(x0_cpu, max_size=384)
+                    
+                if preview_b64:
+                    PromptServer.instance.send_sync("laoli_vs_preview", {
+                        "node_id": node_id, "stage": stage,
+                        "image": preview_b64,
+                        "step": step, "total": total_steps, "final": False,
+                        "lat_h": int(x0.shape[-2]), "lat_w": int(x0.shape[-1])
+                    })
                 del x0_cpu
             except: pass
         return callback
