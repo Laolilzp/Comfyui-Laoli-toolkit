@@ -41,7 +41,7 @@ def _update_status(node_id, msg):
             PromptServer.instance.send_sync("laoli_vs_status", {"node_id": node_id, "msg": msg})
         except:
             pass
-    print(f" ⏳ [VisualSampler] {msg}")
+    print(f" ⏳[VisualSampler] {msg}")
 
 
 def _soft_clean_vram():
@@ -112,8 +112,8 @@ def _safe_vae_encode(vae, pixels, node_id=None):
             res = vae.encode(pixels)
         except Exception as e:
             err_msg = str(e).lower()
-            if any(k in err_msg for k in ["conv2d", "expected", "3d", "4d", "size"]):
-                _update_status(node_id, "⚠️ VAE架构维度不匹配，自适应降维编码中...")
+            if any(k in err_msg for k in["conv2d", "expected", "3d", "4d", "size"]):
+                _update_status(node_id, "⚠️ VAE架构自适应降维编码中...")
                 if pixels.ndim == 5:
                     pixels_4d = pixels.reshape(B * T, H, W, C)
                 else:
@@ -161,14 +161,14 @@ def _safe_vae_decode(vae, latent_samples, node_id=None):
                 if res_cpu.shape[1] in [1, 3, 4] and res_cpu.shape[-1] not in [1, 3, 4]:
                     res_cpu = res_cpu.permute(0, 2, 3, 4, 1)
             elif res_cpu.ndim == 4:
-                if res_cpu.shape[1] in [1, 3, 4] and res_cpu.shape[-1] not in [1, 3, 4]:
+                if res_cpu.shape[1] in[1, 3, 4] and res_cpu.shape[-1] not in[1, 3, 4]:
                     res_cpu = res_cpu.permute(0, 2, 3, 1)
                     
             _soft_clean_vram()
             return res_cpu
         except Exception as e:
             err = str(e).lower()
-            if any(k in err for k in ["memory", "oom", "allocate", "cuda"]):
+            if any(k in err for k in["memory", "oom", "allocate", "cuda"]):
                 _update_status(node_id, "⚠️ 解码OOM，分块...")
                 _force_clean_vram()
                 if hasattr(vae, "decode_tiled"):
@@ -224,7 +224,7 @@ def _color_match(target, source, strength=1.0):
         for b in range(target.shape[0]):
             src_b = min(b, source.shape[0] - 1)
 
-            for c in [1, 2]:
+            for c in[1, 2]:
                 tc = target_ycbcr[b, :, :, c]
                 sc = source_ycbcr[src_b, :, :, c]
 
@@ -345,11 +345,7 @@ def _latent_to_preview_base64_fallback(latent_samples, max_size=384):
             rgb = torch.stack([r, g, b], dim=0)
             
         elif c >= 16:
-            factors = torch.tensor([
-                [-0.0346,  0.0244,  0.0681], [ 0.0034,  0.0210,  0.0687], [ 0.0275, -0.0668, -0.0433], [-0.0174,  0.0160,  0.0617],
-                [ 0.0859,  0.0721,  0.0329], [ 0.0004,  0.0383,  0.0115], [ 0.0405,  0.0861,  0.0915], [-0.0236, -0.0185, -0.0259],
-                [-0.0245,  0.0250,  0.0460], [ 0.0406,  0.0528,  0.0606], [-0.0173, -0.0207, -0.0076], [ 0.0416,  0.0458,  0.0519],
-                [ 0.0526,  0.0754,  0.0945], [-0.0337, -0.0142, -0.0187], [-0.0254, -0.0334, -0.0458], [-0.0204, -0.0330, -0.0415]
+            factors = torch.tensor([[-0.0346,  0.0244,  0.0681],[ 0.0034,  0.0210,  0.0687],[ 0.0275, -0.0668, -0.0433],[-0.0174,  0.0160,  0.0617],[ 0.0859,  0.0721,  0.0329],[ 0.0004,  0.0383,  0.0115],[ 0.0405,  0.0861,  0.0915],[-0.0236, -0.0185, -0.0259],[-0.0245,  0.0250,  0.0460],[ 0.0406,  0.0528,  0.0606], [-0.0173, -0.0207, -0.0076],[ 0.0416,  0.0458,  0.0519],[ 0.0526,  0.0754,  0.0945],[-0.0337, -0.0142, -0.0187],[-0.0254, -0.0334, -0.0458],[-0.0204, -0.0330, -0.0415]
             ], dtype=torch.float32, device="cpu")
             if c > 16:
                 pad = torch.zeros((c - 16, 3), dtype=torch.float32, device="cpu")
@@ -424,15 +420,15 @@ def _vs_simulate_sigmas(scheduler, n):
         w = max(0, min(1, (a - ls) / (a - b) if a != b else 0))
         return (1 - w) * lo + w * (lo + 1)
     if scheduler == "simple":
-        return torch.FloatTensor([float(sigma_table[int(x * total_ts / n)]) for x in range(n)] + [0.0])
+        return torch.FloatTensor([float(sigma_table[int(x * total_ts / n)]) for x in range(n)] +[0.0])
     elif scheduler == "normal":
         st, et = s2ts(s_max), s2ts(s_min)
         ts = torch.linspace(st, et, n + 1 if abs(ts2s(et)) < 1e-5 else n)
-        r = [ts2s(float(t)) for t in ts]
+        r =[ts2s(float(t)) for t in ts]
         if abs(ts2s(et)) >= 1e-5: r.append(0.0)
         return torch.FloatTensor(r)
     elif scheduler == "sgm_uniform":
-        return torch.FloatTensor([ts2s(float(t)) for t in torch.linspace(s2ts(s_max), s2ts(s_min), n + 1)] + [0.0])
+        return torch.FloatTensor([ts2s(float(t)) for t in torch.linspace(s2ts(s_max), s2ts(s_min), n + 1)] +[0.0])
     elif scheduler == "karras":
         return torch.cat([(s_max**(1/7)+torch.linspace(0,1,n)*(s_min**(1/7)-s_max**(1/7)))**7, torch.zeros(1)])
     elif scheduler == "exponential":
@@ -441,7 +437,7 @@ def _vs_simulate_sigmas(scheduler, n):
 
 
 def _vs_parse_sigmas(sigma_str, ms, steps, scheduler, denoise=1.0):
-    vals = [float(x.strip()) for x in
+    vals =[float(x.strip()) for x in
             (sigma_str or "").replace('[','').replace(']','').replace('\n',',').split(',') if x.strip()]
     total_steps = int(steps / denoise) if 0.0 < denoise < 1.0 else steps
     if total_steps == 0: total_steps = steps
@@ -545,17 +541,15 @@ def _native_ksampler(model, seed, steps, cfg, sampler_name, scheduler,
             callback=callback, seed=seed)
     except Exception as e:
         err_msg = str(e).lower()
-        if latent_samples.ndim == 5 and any(k in err_msg for k in ["unpack", "4d", "mismatch", "shape", "conv2d"]):
+        if latent_samples.ndim == 5 and any(k in err_msg for k in["unpack", "4d", "mismatch", "shape", "conv2d", "multiplied"]):
             _update_status(node_id, "⚠️ 检测到2D模型接收了3D/5D环境，启动自适应防弹降维重试...")
             _soft_clean_vram()
             
             B, C, T, H, W = latent_samples.shape
             
-            # 主环境降维
             latent_4d = latent_samples.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
             noise_4d = noise.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
             
-            # Mask降维
             denoise_mask_4d = latent.get("noise_mask")
             if denoise_mask_4d is not None:
                 if denoise_mask_4d.shape[0] == B:
@@ -564,7 +558,6 @@ def _native_ksampler(model, seed, steps, cfg, sampler_name, scheduler,
                     else:
                         denoise_mask_4d = denoise_mask_4d.unsqueeze(1).repeat(1, T, 1, 1).reshape(B * T, denoise_mask_4d.shape[-2], denoise_mask_4d.shape[-1])
             
-            # 参考条件中的潜入炸弹(如 AIO 模型的参考隐空间)全局递归搜索并安全折叠
             def flatten_any(obj):
                 if isinstance(obj, torch.Tensor):
                     if obj.ndim == 5:
@@ -573,14 +566,14 @@ def _native_ksampler(model, seed, steps, cfg, sampler_name, scheduler,
                 elif isinstance(obj, dict):
                     return {k: flatten_any(v) for k, v in obj.items()}
                 elif isinstance(obj, list):
-                    return [flatten_any(v) for v in obj]
+                    return[flatten_any(v) for v in obj]
                 elif isinstance(obj, tuple):
                     return tuple(flatten_any(v) for v in obj)
                 return obj
 
             def flatten_conds(conds):
                 if not conds: return conds
-                new_conds = []
+                new_conds =[]
                 for t in conds:
                     new_conds.append([flatten_any(t[0]), flatten_any(t[1])])
                 return new_conds
@@ -595,12 +588,18 @@ def _native_ksampler(model, seed, steps, cfg, sampler_name, scheduler,
                 guider_4d.set_conds(flatten_conds(positive), flatten_conds(negative))
                 guider_4d.set_cfg(cfg)
                 
-            out_4d = guider_4d.sample(
-                noise_4d, latent_4d, comfy.samplers.sampler_object(sampler_name),
-                run_sigmas, denoise_mask=denoise_mask_4d,
-                callback=callback, seed=seed)
+            try:
+                out_4d = guider_4d.sample(
+                    noise_4d, latent_4d, comfy.samplers.sampler_object(sampler_name),
+                    run_sigmas, denoise_mask=denoise_mask_4d,
+                    callback=callback, seed=seed)
+            except Exception as retry_err:
+                err_retry = str(retry_err).lower()
+                # 终极拦截：如果降维后仍然报错，说明张量通道数与模型强不兼容 (比如用户忘了接 VAE_2)
+                if any(k in err_retry for k in["multiplied", "shape", "size", "channel"]):
+                    raise RuntimeError(f"\n❌ 跨架构(5D转4D)重构后依然失败！\n\n原因：您很可能没有为「VAE_2」连接正确的 VAE。\n当前送入二阶段的 Latent 有 {C} 个通道，但二阶段模型不接受该通道数。\n\n解决办法：请务必确保为「VAE_2」连上与「模型_2」配套的 VAE！\n底层报错: {str(retry_err)}")
+                raise retry_err
             
-            # 2D 跑完后重构完美视频/3D数据结构
             out_samples = out_4d.reshape(B, T, out_4d.shape[1], H, W).permute(0, 2, 1, 3, 4)
         else:
             raise e
@@ -882,11 +881,12 @@ class LaoliVisualSampler:
             s1_add_noise = kwargs.get("添加噪波_1", "enable")
             s1_ret_noise = kwargs.get("返回噪波_1", "disable")
 
-            s1_key = (f"{unique_id}_{id(model1)}_{hash_t(pos_t)}_{hash_t(neg_t)}_"
+            # ★加入 VAE_1 和 VAE_2 的底层ID，完美阻断由于换 VAE 但没换参数造成的错误缓存命中
+            s1_key = (f"{unique_id}_{id(model1)}_{id(vae)}_{id(vae2)}_{hash_t(pos_t)}_{hash_t(neg_t)}_"
                       f"{hash_t(latent.get('samples'))}_{seed1}_{steps1}_{cfg1}_{denoise1}_"
                       f"{s1_sampler}_{scheduler1}_{s1_add_noise}_{s1_ret_noise}_"
                       f"{start1}_{end1}_{hash_t(custom_s1)}_"
-                      f"{upscale_factor}_{upscale_mode}_{upscale_method}_{up_name}_v20")
+                      f"{upscale_factor}_{upscale_mode}_{upscale_method}_{up_name}_v22")
 
             global _vs_stage1_cache
             cached = _vs_stage1_cache.get(unique_id)
